@@ -1,0 +1,437 @@
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { isGatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
+import { t } from "../../i18n/index.ts";
+import {
+  cardsWithPendingDrops,
+  changedDraftPayload,
+  draftPayload,
+  planWorkboardCardDrop,
+  rebaseWorkboardDraft,
+  removeCardAndReferences,
+  replaceCard,
+  resetDraftState,
+  selectedWorkboardBoardParams,
+  setWorkboardCards,
+} from "./card-state.ts";
+import { loadWorkboard } from "./loading.ts";
+import { formatError } from "./normalization-utils.ts";
+import { normalizeCardPayload, normalizeCardsPayload } from "./normalization.ts";
+import {
+  getWorkboardRuntime,
+  getWorkboardState,
+  notifyWorkboard,
+  invalidateWorkboardLoads,
+  workboardHasActiveWrites,
+  workboardMutationsReady,
+  type WorkboardClientContext,
+} from "./runtime.ts";
+import type {
+  WorkboardCard,
+  WorkboardDeleteResult,
+  WorkboardDispatchSummary,
+  WorkboardStatus,
+} from "./types.ts";
+
+function normalizeDispatchSummary(value: unknown): WorkboardDispatchSummary {
+  const countArray = (key: string) =>
+    isRecord(value) && Array.isArray(value[key]) ? value[key].length : 0;
+  const failure =
+    isRecord(value) && Array.isArray(value.startFailures) ? value.startFailures[0] : undefined;
+  return {
+    firstFailure:
+      isRecord(failure) && typeof failure.title === "string" && typeof failure.error === "string"
+        ? `${failure.title}: ${failure.error}`
+        : null,
+    started: countArray("started"),
+    failures: countArray("startFailures"),
+    promoted: countArray("promoted"),
+    blocked: countArray("blocked"),
+    reclaimed: countArray("reclaimed"),
+    orchestrated: countArray("orchestrated"),
+  };
+}
+
+export async function saveWorkboardCardDraft(params: WorkboardClientContext) {
+  const state = getWorkboardState(params.host);
+  const cardId = state.editingCardId;
+  const base = cardId ? state.editingCardBase : null;
+  if (
+    !params.client ||
+    !workboardMutationsReady(state) ||
+    !state.draftTitle.trim() ||
+    state.dispatching ||
+    state.draftSaving ||
+    (cardId && state.busyCardIds.has(cardId))
+  ) {
+    return;
+  }
+  if (cardId && (!base || base.id !== cardId)) {
+    state.error = t("workboard.cardChangedBeforeEdit");
+    notifyWorkboard(params.host);
+    return;
+  }
+  invalidateWorkboardLoads(params.host);
+  state.draftSaving = true;
+  state.loading = true;
+  state.error = null;
+  notifyWorkboard(params.host);
+  try {
+    let payload: unknown;
+    if (base) {
+      const patch = changedDraftPayload(state);
+      if (Object.keys(patch).length === 0) {
+        resetDraftState(state);
+        return;
+      }
+      payload = await params.client.request("workboard.cards.update", {
+        id: cardId,
+        expectedUpdatedAt: base.updatedAt,
+        patch,
+      });
+    } else {
+      payload = await params.client.request("workboard.cards.create", {
+        ...draftPayload(state),
+        ...selectedWorkboardBoardParams(state),
+      });
+    }
+    replaceCard(state, normalizeCardPayload(payload));
+    resetDraftState(state);
+  } catch (error) {
+    const conflict = base && reconcileCardConflict(state, error);
+    if (conflict) {
+      rebaseWorkboardDraft(state, conflict);
+      state.error = t("workboard.editConflict");
+    } else {
+      state.error = formatError(error);
+    }
+  } finally {
+    state.draftSaving = false;
+    state.loading = false;
+    notifyWorkboard(params.host);
+  }
+}
+
+export async function addWorkboardCardComment(
+  params: WorkboardClientContext & {
+    cardId?: string;
+    body?: string;
+  },
+) {
+  const draftState = getWorkboardState(params.host);
+  const cardId = params.cardId ?? draftState.editingCardId;
+  const draftField = params.body === undefined ? "draftCommentBody" : "detailCommentBody";
+  const submittedDraft = params.body ?? draftState.draftCommentBody;
+  const body = submittedDraft.trim();
+  if (!cardId || !body || draftState.draftSaving) {
+    return;
+  }
+  await runWorkboardCardMutation(
+    { ...params, cardId, reconcileConflict: false },
+    async (state, client) => {
+      const payload = await client.request("workboard.cards.comment", {
+        id: cardId,
+        body,
+      });
+      const current = normalizeCardPayload(payload);
+      replaceCard(state, current);
+      if (state.editingCardId === cardId && state.editingCardBase?.id === cardId) {
+        rebaseWorkboardDraft(state, current);
+      }
+      // The operator may type another note or switch cards while this request settles.
+      // Clear only the draft that submitted it, preserving the raw text for comparison.
+      const draftCardId =
+        draftField === "draftCommentBody" ? state.editingCardId : state.detailCardId;
+      if (
+        draftField === "detailCommentBody" &&
+        state.detailCommentDrafts.get(cardId) === submittedDraft
+      ) {
+        state.detailCommentDrafts.delete(cardId);
+      }
+      if (draftCardId === cardId && state[draftField] === submittedDraft) {
+        state[draftField] = "";
+      }
+    },
+  );
+}
+
+function reconcileCardConflict(
+  state: ReturnType<typeof getWorkboardState>,
+  error: unknown,
+  applyCard = replaceCard,
+) {
+  if (
+    isGatewayRequestError(error) &&
+    error.code === "workboard_conflict" &&
+    isRecord(error.details) &&
+    error.details.type === "workboard_card_conflict"
+  ) {
+    const card = normalizeCardPayload(error.details);
+    applyCard(state, card);
+    return card;
+  }
+  return null;
+}
+
+export async function moveWorkboardCard(
+  params: WorkboardClientContext & {
+    cardId: string;
+    status: WorkboardStatus;
+    expectedUpdatedAt?: number;
+  } & (
+      | { position: number; beforeCardId?: never }
+      | { beforeCardId: string | null; boardFilter: string; position?: never }
+    ),
+) {
+  const current = getWorkboardState(params.host);
+  if (current.nextCursor && params.beforeCardId !== undefined) {
+    return;
+  }
+  const cards = cardsWithPendingDrops(current);
+  const card = cards.find((candidate) => candidate.id === params.cardId);
+  const dropPlan =
+    card && params.beforeCardId !== undefined
+      ? planWorkboardCardDrop(cards, card, params.status, params.beforeCardId, params.boardFilter)
+      : [];
+  const moves =
+    params.beforeCardId === undefined
+      ? [
+          {
+            id: params.cardId,
+            status: params.status,
+            ...(current.nextCursor ? {} : { position: params.position }),
+          },
+        ]
+      : dropPlan;
+  if (!moves.length) {
+    return;
+  }
+  let reloadAfterFailure = false;
+  await runWorkboardCardMutation(
+    { ...params, cardIds: moves.map((move) => move.id), reconcileConflict: false },
+    async (state, client) => {
+      // A recovered older load must not clear an error owned by this move.
+      delete getWorkboardRuntime(params.host).loadError;
+      if (dropPlan.length) {
+        for (const move of dropPlan) {
+          state.pendingDrops.set(move.id, { status: params.status, position: move.position });
+        }
+        notifyWorkboard(params.host);
+      }
+      try {
+        for (const move of moves) {
+          const payload =
+            "expectedUpdatedAt" in move
+              ? await client.request("workboard.cards.update", {
+                  id: move.id,
+                  expectedUpdatedAt: move.expectedUpdatedAt,
+                  patch: { position: move.position },
+                })
+              : await client.request("workboard.cards.move", {
+                  ...move,
+                  ...(params.expectedUpdatedAt !== undefined && move.id === params.cardId
+                    ? { expectedUpdatedAt: params.expectedUpdatedAt }
+                    : {}),
+                });
+          replaceCard(state, normalizeCardPayload(payload));
+          state.pendingDrops.delete(move.id);
+        }
+      } catch (error) {
+        state.error = formatError(error);
+        if (!reconcileCardConflict(state, error)) {
+          // Even a single move can commit before its acknowledgment is lost.
+          state.mutationReadiness = "canonical_reload_required";
+          state.loaded = false;
+          state.loadAttempted = false;
+          reloadAfterFailure = true;
+        }
+      } finally {
+        // Only remove this drop's unconfirmed placements; never rewind a successful peer write.
+        for (const move of dropPlan) {
+          state.pendingDrops.delete(move.id);
+        }
+        if (state.draggedCardId === params.cardId) {
+          state.draggedCardId = null;
+        }
+      }
+    },
+  );
+  if (reloadAfterFailure) {
+    invalidateWorkboardLoads(params.host);
+    await loadWorkboard({
+      host: params.host,
+      client: params.client,
+      force: true,
+      preserveError: true,
+    });
+  }
+}
+
+type WorkboardCardMutationParams = WorkboardClientContext & {
+  cardId: string;
+};
+
+export async function runWorkboardCardMutation<T>(
+  params: WorkboardCardMutationParams & {
+    cardIds?: readonly string[];
+    reconcileConflict?: false | typeof replaceCard;
+  },
+  mutate: (state: ReturnType<typeof getWorkboardState>, client: GatewayBrowserClient) => Promise<T>,
+): Promise<T | false> {
+  const state = getWorkboardState(params.host);
+  const cardIds = params.cardIds ?? [params.cardId];
+  if (
+    !params.client ||
+    !workboardMutationsReady(state) ||
+    state.dispatching ||
+    cardIds.some((id) => state.busyCardIds.has(id))
+  ) {
+    return false;
+  }
+  invalidateWorkboardLoads(params.host);
+  for (const id of cardIds) {
+    state.busyCardIds.add(id);
+  }
+  state.error = null;
+  notifyWorkboard(params.host);
+  try {
+    return await mutate(state, params.client);
+  } catch (error) {
+    if (params.reconcileConflict !== false) {
+      reconcileCardConflict(state, error, params.reconcileConflict);
+    }
+    state.error = formatError(error);
+    return false;
+  } finally {
+    for (const id of cardIds) {
+      state.busyCardIds.delete(id);
+    }
+    notifyWorkboard(params.host);
+  }
+}
+
+export async function updateWorkboardCardProperties(
+  params: WorkboardClientContext & {
+    card: WorkboardCard;
+    patch: Partial<Pick<WorkboardCard, "priority" | "labels" | "agentId" | "title" | "notes">>;
+    previewInline?: boolean;
+  },
+) {
+  const applyCard: typeof replaceCard = params.previewInline
+    ? (state, receipt) => {
+        const index = state.cards.findIndex((card) => card.id === receipt.id);
+        const current = state.cards[index];
+        if (!current || current.updatedAt > receipt.updatedAt) {
+          return;
+        }
+        if (current.position === receipt.position) {
+          // A property edit doesn't move the card behind peers with the same position.
+          setWorkboardCards(state, state.cards.with(index, receipt));
+        } else {
+          replaceCard(state, receipt);
+        }
+      }
+    : replaceCard;
+  return runWorkboardCardMutation(
+    { ...params, cardId: params.card.id, reconcileConflict: applyCard },
+    async (state, client) => {
+      const { card, patch } = params;
+      // Only the observed card gets the preview. A replacement from the Gateway
+      // supplies its own values; dropping the preview never restores an old list.
+      if (params.previewInline) {
+        state.inlinePreviews.set(card, { ...card, ...patch });
+        notifyWorkboard(params.host);
+      }
+      try {
+        const payload = await client.request("workboard.cards.update", {
+          id: card.id,
+          expectedUpdatedAt: card.updatedAt,
+          patch,
+        });
+        applyCard(state, normalizeCardPayload(payload));
+        return true;
+      } finally {
+        state.inlinePreviews.delete(card);
+      }
+    },
+  );
+}
+
+export async function deleteWorkboardCard(
+  params: WorkboardCardMutationParams & { expectedUpdatedAt?: number },
+): Promise<WorkboardDeleteResult | false> {
+  return runWorkboardCardMutation(params, async (state, client) => {
+    const result = await client.request<WorkboardDeleteResult>("workboard.cards.delete", {
+      id: params.cardId,
+      ...(params.expectedUpdatedAt !== undefined
+        ? { expectedUpdatedAt: params.expectedUpdatedAt }
+        : {}),
+    });
+    const referenceUpdates = new Map(
+      (result.referenceUpdates ?? []).map((receipt) => [receipt.id, receipt]),
+    );
+    const remaining = removeCardAndReferences(state.cards, params.cardId);
+    for (const [index, card] of remaining.entries()) {
+      const receipt = referenceUpdates.get(card.id);
+      if (receipt && card.updatedAt === receipt.previousUpdatedAt) {
+        remaining[index] = { ...card, updatedAt: receipt.updatedAt };
+      }
+    }
+    setWorkboardCards(state, remaining);
+    return result;
+  });
+}
+
+export async function archiveWorkboardCard(
+  params: WorkboardCardMutationParams & { archived?: boolean; expectedUpdatedAt?: number },
+) {
+  return runWorkboardCardMutation(params, async (state, client) => {
+    const payload = await client.request("workboard.cards.archive", {
+      id: params.cardId,
+      archived: params.archived ?? true,
+      ...(params.expectedUpdatedAt !== undefined
+        ? { expectedUpdatedAt: params.expectedUpdatedAt }
+        : {}),
+    });
+    replaceCard(state, normalizeCardPayload(payload));
+    return true;
+  });
+}
+
+export async function dispatchWorkboard(params: WorkboardClientContext) {
+  const state = getWorkboardState(params.host);
+  if (
+    !params.client ||
+    !workboardMutationsReady(state) ||
+    state.dispatching ||
+    workboardHasActiveWrites(state)
+  ) {
+    return;
+  }
+  invalidateWorkboardLoads(params.host);
+  state.dispatching = true;
+  state.error = null;
+  state.lastDispatchSummary = null;
+  state.bulkResult = null;
+  notifyWorkboard(params.host);
+  try {
+    const dispatchResult = await params.client.request(
+      "workboard.cards.dispatch",
+      selectedWorkboardBoardParams(state),
+    );
+    const payload = await params.client.request("workboard.cards.list", {});
+    const normalized = normalizeCardsPayload(payload);
+    setWorkboardCards(state, normalized.cards);
+    state.statuses = normalized.statuses;
+    state.nextCursor = normalized.nextCursor;
+    state.boards = normalized.boards;
+    state.lastDispatchSummary = normalizeDispatchSummary(dispatchResult);
+    // A teardown may have invalidated this in-flight dispatch. Keep its cached
+    // result reload-required so reconnect cannot treat an old completion as canonical.
+    state.loaded = workboardMutationsReady(state);
+  } catch (error) {
+    state.error = formatError(error);
+  } finally {
+    state.dispatching = false;
+    notifyWorkboard(params.host);
+  }
+}
